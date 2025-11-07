@@ -14,7 +14,7 @@
 日志：
 - 抓取来源、数量、每步统计、snapshot 读写绝对路径
 
-适配你当前的 workflow（每 21 分钟）
+适配你的 workflow（每 21 分钟）
 """
 import json, os, re, time, traceback, xml.etree.ElementTree as ET
 from dataclasses import dataclass, asdict
@@ -92,7 +92,6 @@ def get_json(url: str, retries: int = 3, timeout: int = 20):
                 ct = (r.headers.get("Content-Type") or "")
                 if "json" in ct or url.endswith(".js") or url.endswith(".json"):
                     return r.json()
-                # 某些主题返回 js 文本也能被 .json() 解析失败；直接忽略
                 log(f"get_json warn content-type for {url}: {ct}")
                 return None
             else:
@@ -150,8 +149,7 @@ def find_product_handles_from_html(html: str) -> Set[str]:
             handles.add(parts[1])
     return handles
 
-def crawl_collections_all(max_pages: int = 40) -> List[str]:
-    """遍历 /collections/all?page=N，直到无新链接或到达上限"""
+def crawl_collections_all(max_pages: int = 50) -> List[str]:
     all_handles: Set[str] = set()
     for page in range(1, max_pages + 1):
         url = urljoin(BASE, f"/collections/all?page={page}")
@@ -164,7 +162,6 @@ def crawl_collections_all(max_pages: int = 40) -> List[str]:
         prev_size = len(all_handles)
         all_handles |= found
         if len(all_handles) == prev_size:
-            # 本页没有带来新产品，可能到尾页
             if page > 1:
                 log("no new handles on this page, stop.")
                 break
