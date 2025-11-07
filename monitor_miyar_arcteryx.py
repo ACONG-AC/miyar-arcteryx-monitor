@@ -14,6 +14,8 @@
 • 价格：CA$ 360
 🧾 库存信息：XL:1
 
+🔗 [直达链接](https://store.miyaradventures.com/products/atom-hoody-mens)
+
 （右侧商品缩略图）
 """
 import json, os, time, traceback, xml.etree.ElementTree as ET
@@ -97,7 +99,6 @@ def get_json(url: str, retries: int = 3, timeout: int = 20):
                     return r.json()
                 else:
                     log(f"WARNING: Content-Type not json for {url}: {ct}")
-                    # 尝试强行解析（若主题返回 js 对象文本会失败）
                     try:
                         return r.json()
                     except Exception:
@@ -138,16 +139,11 @@ def iter_sitemap_product_urls() -> List[str]:
             break
         try:
             root = ET.fromstring(xml)
-            ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0/9", "sm0": "http://www.sitemaps.org/schemas/sitemap/0.9"}
-            # 兼容两种命名
+            # 直接用命名空间 URI，兼容性更好
             nodes = root.findall(".//{http://www.sitemaps.org/schemas/sitemap/0.9}url")
-            if not nodes:  # 兼容备用 ns key
-                nodes = root.findall("sm0:url", {"sm0": "http://www.sitemaps.org/schemas/sitemap/0.9"})
             count = 0
             for n in nodes:
                 loc = n.find("{http://www.sitemaps.org/schemas/sitemap/0.9}loc")
-                if loc is None:
-                    loc = n.find("sm0:loc", {"sm0":"http://www.sitemaps.org/schemas/sitemap/0.9"})
                 if loc is not None and loc.text:
                     urls.append(loc.text.strip())
                     count += 1
@@ -264,7 +260,7 @@ def save_snapshot(snap: Snapshot):
     except Exception as e:
         log(f"save_snapshot error: {e}\n{traceback.format_exc()}")
 
-# ---------------- Discord（embed，miyar 文案） ----------------
+# ---------------- Discord（embed，miyar 文案 + 链接） ----------------
 def send_embed(description: str, thumb: Optional[str]):
     if not DISCORD_WEBHOOK:
         log("[NO WEBHOOK] printing message instead:\n" + description)
@@ -291,6 +287,9 @@ def format_inventory(p: ProductState) -> str:
         counts[size] = counts.get(size, 0) + max(0, int(qty))
     return " | ".join(f"{k}:{v}" for k, v in counts.items()) or "无"
 
+def link_line(p: ProductState) -> str:
+    return f"🔗 [直达链接]({p.url})"
+
 def desc_new(p: ProductState) -> str:
     anyv = next(iter(p.variants.values()))
     price_line = f"• 价格：CA$ {anyv.price:.0f}" if anyv.price == int(anyv.price) else f"• 价格：CA$ {anyv.price:.2f}"
@@ -301,6 +300,7 @@ def desc_new(p: ProductState) -> str:
         f"• 颜色：{anyv.option1 or '未知'}\n"
         f"{price_line}\n"
         f"🧾 库存信息：{format_inventory(p)}\n\n"
+        f"{link_line(p)}\n\n"
         "（右侧商品缩略图）"
     )
 
@@ -313,6 +313,7 @@ def desc_restock(p: ProductState, v: VariantState) -> str:
         f"• 颜色：{v.option1 or '未知'}\n"
         f"{price_line}\n"
         f"🧾 库存信息：{v.option2 or 'N/A'}:{v.inventory_quantity if isinstance(v.inventory_quantity, int) else (1 if v.available else 0)}\n\n"
+        f"{link_line(p)}\n\n"
         "（右侧商品缩略图）"
     )
 
@@ -324,6 +325,7 @@ def desc_price_change(p: ProductState, vold: VariantState, vnew: VariantState) -
         f"• 颜色：{vnew.option1 or '未知'}\n"
         f"• 价格：CA$ {vold.price:.2f} → CA$ {vnew.price:.2f}\n"
         f"🧾 库存信息：{vnew.option2 or 'N/A'}:{vnew.inventory_quantity if isinstance(vnew.inventory_quantity, int) else (1 if vnew.available else 0)}\n\n"
+        f"{link_line(p)}\n\n"
         "（右侧商品缩略图）"
     )
 
