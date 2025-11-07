@@ -1,34 +1,54 @@
-# monitor_miyar_arcteryx.py
 # -*- coding: utf-8 -*-
-import json, os, re, time, math
-from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional, Tuple
-from urllib.parse import urljoin, urlparse
+"""
+监控 https://store.miyaradventures.com/ 上所有 Arc'teryx 商品（变体级）
+- 上新（新商品/新变体）
+- 价格变化
+- 库存状态变化（缺货↔到货）
+- 库存数量增加（若主题暴露 inventory_quantity）
+并按如下格式逐条通过 Discord Webhook 推送（右侧缩略图）：
+
+🔔 上新提醒 🇨🇦 加拿大官网
+• 名称：Atom Hoody Men's
+• 货号：X000009556
+• 颜色：Trail Magic
+• 价格：CA$ 360
+🧾 库存信息：XL:1
+
+（右侧商品缩略图）
+"""
+import json
+import os
+import time
+import math
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass, asdict
+from typing import Dict, List, Optional
+from urllib.parse import urljoin, urlparse
 
 import requests
 
+# --------- 基本配置 ----------
 BASE = "https://store.miyaradventures.com/"
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
 SNAPSHOT_PATH = os.environ.get("SNAPSHOT_PATH", "snapshot.json")
-USER_AGENT = "Mozilla/5.0 (compatible; ArcMonitor/1.0; +https://github.com)"
+USER_AGENT = "Mozilla/5.0 (compatible; MiyarArcMonitor/1.0; +https://github.com)"
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": USER_AGENT, "Accept": "*/*"})
 
-# ---------- Data models ----------
+# ---------- 数据模型 ----------
 @dataclass
 class VariantState:
     id: int
-    title: str             # e.g., "Black / M"
-    option1: Optional[str] # color
-    option2: Optional[str] # size
+    title: str
+    option1: Optional[str]  # 常为颜色
+    option2: Optional[str]  # 常为尺码
     option3: Optional[str]
     sku: Optional[str]
     price: float
     compare_at_price: Optional[float]
     available: bool
-    inventory_quantity: Optional[int]  # may be None if theme doesn’t expose
+    inventory_quantity: Optional[int]  # 主题不一定暴露
 
 @dataclass
 class ProductState:
@@ -36,18 +56,19 @@ class ProductState:
     title: str
     vendor: Optional[str]
     url: str
-    variants: Dict[str, VariantState]  # key by variant_id str
+    image: Optional[str]
+    variants: Dict[str, VariantState]  # key: variant_id(str)
 
-Snapshot = Dict[str, ProductState]  # key by handle
+Snapshot = Dict[str, ProductState]  # key: handle
 
-# ---------- Utilities ----------
+
+# ---------- 工具函数 ----------
 def money_to_float(x) -> float:
     try:
         if x is None:
             return 0.0
         if isinstance(x, (int, float)):
-            # Shopify often stores cents (e.g., 24900) on some endpoints; product.js uses decimal string
-            # Normalize: if looks like cents integer and > 1000, divide by 100
+            # 有些端点用分为单位的整数
             if isinstance(x, int) and x > 1000:
                 return round(x / 100.0, 2)
             return float(x)
@@ -59,8 +80,14 @@ def money_to_float(x) -> float:
 def try_get(d, *keys, default=None):
     cur = d
     for k in keys:
-        if cur is None: return default
-        cur = cur.get(k)
+        if cur is None:
+            return default
+        if isinstance(cur, dict):
+            cur = cur.get(k)
+        elif isinstance(cur, list) and isinstance(k, int):
+            cur = cur[k] if 0 <= k < len(cur) else None
+        else:
+            return default
     return default if cur is None else cur
 
 def get_json(url: str, retries: int = 3, timeout: int = 20):
@@ -68,15 +95,12 @@ def get_json(url: str, retries: int = 3, timeout: int = 20):
         try:
             r = SESSION.get(url, timeout=timeout)
             if r.status_code == 200:
-                ct = r.headers.get("Content-Type", "")
-                if "json" in ct or url.endswith(".js") or url.endswith(".json"):
-                    return r.json()
-                return None
+                return r.json()
             if r.status_code in (403, 404):
                 return None
         except requests.RequestException:
             pass
-        time.sleep(1.5 * (i + 1))
+        time.sleep(1.2 * (i + 1))
     return None
 
 def get_text(url: str, retries: int = 3, timeout: int = 20) -> Optional[str]:
@@ -89,30 +113,29 @@ def get_text(url: str, retries: int = 3, timeout: int = 20) -> Optional[str]:
                 return None
         except requests.RequestException:
             pass
-        time.sleep(1.5 * (i + 1))
+        time.sleep(1.2 * (i + 1))
     return None
 
-# ---------- Fetch product lists ----------
+
+# ---------- 商品列表抓取 ----------
 def fetch_products_via_products_json(limit: int = 250) -> List[dict]:
-    """Try Shopify /products.json paginated."""
+    """优先使用 /products.json 分页抓取"""
     out = []
     page = 1
     while True:
         url = urljoin(BASE, f"/products.json?limit={limit}&page={page}")
         data = get_json(url)
-        if not data or "products" not in data or not data["products"]:
+        if not data or not data.get("products"):
             break
         out.extend(data["products"])
         page += 1
-        # polite delay
-        time.sleep(0.6)
-        # Avoid runaway
-        if page > 40:
+        time.sleep(0.5)
+        if page > 40:  # 安全阈值
             break
     return out
 
 def iter_sitemap_product_urls() -> List[str]:
-    """Enumerate all product URLs via sitemap_products_*.xml."""
+    """备用方案：遍历 sitemap_products_*.xml 获取产品 URL"""
     urls = []
     idx = 1
     while True:
@@ -122,9 +145,9 @@ def iter_sitemap_product_urls() -> List[str]:
             break
         try:
             root = ET.fromstring(xml)
-            # Shopify sitemaps: <urlset><url><loc>...</loc></url>...
-            for urlnode in root.findall("{http://www.sitemaps.org/schemas/sitemap/0.9}url"):
-                loc = urlnode.find("{http://www.sitemaps.org/schemas/sitemap/0.9}loc")
+            ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+            for node in root.findall("sm:url", ns):
+                loc = node.find("sm:loc", ns)
                 if loc is not None and loc.text:
                     urls.append(loc.text.strip())
         except ET.ParseError:
@@ -132,11 +155,10 @@ def iter_sitemap_product_urls() -> List[str]:
         idx += 1
         if idx > 30:
             break
-        time.sleep(0.4)
+        time.sleep(0.3)
     return urls
 
 def handle_from_product_url(purl: str) -> Optional[str]:
-    # Expect /products/<handle>
     try:
         path = urlparse(purl).path
         parts = [p for p in path.split("/") if p]
@@ -147,135 +169,75 @@ def handle_from_product_url(purl: str) -> Optional[str]:
     return None
 
 def fetch_product_js_by_handle(handle: str) -> Optional[dict]:
-    url = urljoin(BASE, f"/products/{handle}.js")
-    return get_json(url)
+    return get_json(urljoin(BASE, f"/products/{handle}.js"))
 
-# ---------- Normalize to our snapshot schema ----------
-def normalize_product(product_obj: dict, from_products_json: bool) -> Optional[ProductState]:
-    # product.js has keys: title, vendor, handle, url, variants (with available, inventory_quantity possibly)
-    if from_products_json:
-        handle = product_obj.get("handle")
-        title  = product_obj.get("title")
-        vendor = product_obj.get("vendor")
-        url    = urljoin(BASE, f"/products/{handle}")
-        variants = {}
-        for v in product_obj.get("variants", []):
-            vid = v.get("id")
-            variants[str(vid)] = VariantState(
-                id = int(vid),
-                title = v.get("title") or "",
-                option1 = v.get("option1"),
-                option2 = v.get("option2"),
-                option3 = v.get("option3"),
-                sku = v.get("sku"),
-                price = money_to_float(v.get("price")),
-                compare_at_price = money_to_float(v.get("compare_at_price")) if v.get("compare_at_price") else None,
-                available = bool(v.get("available", False)),
-                inventory_quantity = v.get("inventory_quantity") if isinstance(v.get("inventory_quantity"), int) else None
-            )
-        return ProductState(handle=handle, title=title, vendor=vendor, url=url, variants=variants)
-    else:
-        handle = product_obj.get("handle")
-        title  = product_obj.get("title")
-        vendor = product_obj.get("vendor")
-        url    = product_obj.get("url") or urljoin(BASE, f"/products/{handle}")
-        variants = {}
-        for v in product_obj.get("variants", []):
-            vid = v.get("id")
-            variants[str(vid)] = VariantState(
-                id = int(vid),
-                title = v.get("title") or "",
-                option1 = v.get("option1"),
-                option2 = v.get("option2"),
-                option3 = v.get("option3"),
-                sku = v.get("sku"),
-                price = money_to_float(v.get("price")),
-                compare_at_price = money_to_float(v.get("compare_at_price")) if v.get("compare_at_price") else None,
-                available = bool(v.get("available", False)),
-                inventory_quantity = v.get("inventory_quantity") if isinstance(v.get("inventory_quantity"), int) else None
-            )
-        return ProductState(handle=handle, title=title, vendor=vendor, url=url, variants=variants)
 
-def load_snapshot() -> Snapshot:
-    if not os.path.exists(SNAPSHOT_PATH):
-        return {}
-    with open(SNAPSHOT_PATH, "r", encoding="utf-8") as f:
-        raw = json.load(f)
-    snap: Snapshot = {}
-    for handle, pdata in raw.items():
-        variants = {
-            vid: VariantState(**v) for vid, v in pdata["variants"].items()
-        }
-        snap[handle] = ProductState(
-            handle=pdata["handle"], title=pdata["title"], vendor=pdata.get("vendor"),
-            url=pdata["url"], variants=variants
+# ---------- 标准化 ----------
+def normalize_product_from_products_json(p: dict) -> Optional[ProductState]:
+    handle = p.get("handle")
+    if not handle:
+        return None
+    url = urljoin(BASE, f"/products/{handle}")
+    image = try_get(p, "images", 0, "src")
+    variants: Dict[str, VariantState] = {}
+    for v in p.get("variants", []):
+        vid = str(v.get("id"))
+        variants[vid] = VariantState(
+            id=int(v.get("id")),
+            title=v.get("title") or "",
+            option1=v.get("option1"),
+            option2=v.get("option2"),
+            option3=v.get("option3"),
+            sku=v.get("sku"),
+            price=money_to_float(v.get("price")),
+            compare_at_price=money_to_float(v.get("compare_at_price")) if v.get("compare_at_price") else None,
+            available=bool(v.get("available", False)),
+            inventory_quantity=v.get("inventory_quantity") if isinstance(v.get("inventory_quantity"), int) else None,
         )
-    return snap
-
-def save_snapshot(snap: Snapshot):
-    serializable = {
-        h: {
-            "handle": p.handle, "title": p.title, "vendor": p.vendor, "url": p.url,
-            "variants": {vid: asdict(v) for vid, v in p.variants.items()}
-        }
-        for h, p in snap.items()
-    }
-    with open(SNAPSHOT_PATH, "w", encoding="utf-8") as f:
-        json.dump(serializable, f, ensure_ascii=False, indent=2)
-
-# ---------- Discord ----------
-def send_discord(content: str):
-    if not DISCORD_WEBHOOK:
-        print("[WARN] DISCORD_WEBHOOK not set; printing instead:")
-        print(content)
-        return
-    payload = {"content": content}
-    # Avoid Origin/Referer to keep webhook happy
-    headers = {"Content-Type": "application/json", "User-Agent": USER_AGENT}
-    for i in range(3):
-        try:
-            r = SESSION.post(DISCORD_WEBHOOK, headers=headers, data=json.dumps(payload), timeout=20)
-            if 200 <= r.status_code < 300:
-                return
-        except requests.RequestException:
-            pass
-        time.sleep(1.2 * (i + 1))
-
-# ---------- Diff & reporting ----------
-def variant_label(v: VariantState) -> str:
-    parts = [p for p in [v.option1, v.option2, v.option3] if p]
-    return " / ".join(parts) if parts else v.title or "Variant"
-
-def report_new_product(p: ProductState):
-    send_discord(f"🆕 上新 | {p.title} · {p.vendor or ''}\n{p.url}")
-
-def report_new_variant(p: ProductState, v: VariantState):
-    send_discord(f"🧩 新增变体 | {p.title} → {variant_label(v)}\n{p.url}")
-
-def report_price_change(p: ProductState, old: VariantState, new: VariantState):
-    send_discord(
-        f"💲 价格变化 | {p.title} → {variant_label(new)}\n"
-        f"{old.price:.2f} → {new.price:.2f}"
-        + (f"（对比价 {new.compare_at_price:.2f}）" if new.compare_at_price else "") +
-        f"\n{p.url}"
+    return ProductState(
+        handle=handle,
+        title=p.get("title") or "",
+        vendor=p.get("vendor"),
+        url=url,
+        image=image,
+        variants=variants,
     )
 
-def report_stock_status(p: ProductState, old: VariantState, new: VariantState):
-    emoji = "✅" if new.available and not old.available else "⛔"
-    send_discord(
-        f"{emoji} 库存状态 | {p.title} → {variant_label(new)}\n"
-        f"{'缺货→到货' if new.available and not old.available else '在售→缺货'}\n{p.url}"
+def normalize_product_from_js(p: dict) -> Optional[ProductState]:
+    handle = p.get("handle")
+    if not handle:
+        return None
+    url = p.get("url") or urljoin(BASE, f"/products/{handle}")
+    image = try_get(p, "images", 0)
+    variants: Dict[str, VariantState] = {}
+    for v in p.get("variants", []):
+        vid = str(v.get("id"))
+        variants[vid] = VariantState(
+            id=int(v.get("id")),
+            title=v.get("title") or "",
+            option1=v.get("option1"),
+            option2=v.get("option2"),
+            option3=v.get("option3"),
+            sku=v.get("sku"),
+            price=money_to_float(v.get("price")),
+            compare_at_price=money_to_float(v.get("compare_at_price")) if v.get("compare_at_price") else None,
+            available=bool(v.get("available", False)),
+            inventory_quantity=v.get("inventory_quantity") if isinstance(v.get("inventory_quantity"), int) else None,
+        )
+    return ProductState(
+        handle=handle,
+        title=p.get("title") or "",
+        vendor=p.get("vendor"),
+        url=url,
+        image=image,
+        variants=variants,
     )
 
-def report_inventory_increase(p: ProductState, old: VariantState, new: VariantState, delta: int):
-    send_discord(
-        f"📦 库存增加 | {p.title} → {variant_label(new)}\n"
-        f"{old.inventory_quantity} → {new.inventory_quantity}（+{delta}）\n{p.url}"
-    )
 
-def is_arcteryx(product_title: str, vendor: Optional[str], tags: Optional[List[str]] = None) -> bool:
+# ---------- Arc'teryx 判定 ----------
+def is_arcteryx(title: str, vendor: Optional[str], tags: Optional[List[str]] = None) -> bool:
+    t = (title or "").lower()
     v = (vendor or "").lower()
-    t = (product_title or "").lower()
     if "arc'teryx" in v or "arcteryx" in v:
         return True
     if "arc'teryx" in t or "arcteryx" in t:
@@ -286,90 +248,217 @@ def is_arcteryx(product_title: str, vendor: Optional[str], tags: Optional[List[s
             return True
     return False
 
+
+# ---------- 快照 ----------
+def load_snapshot() -> Snapshot:
+    if not os.path.exists(SNAPSHOT_PATH):
+        return {}
+    with open(SNAPSHOT_PATH, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    snap: Snapshot = {}
+    for handle, pdata in raw.items():
+        variants = {vid: VariantState(**v) for vid, v in pdata["variants"].items()}
+        snap[handle] = ProductState(
+            handle=pdata["handle"],
+            title=pdata["title"],
+            vendor=pdata.get("vendor"),
+            url=pdata["url"],
+            image=pdata.get("image"),
+            variants=variants,
+        )
+    return snap
+
+def save_snapshot(snap: Snapshot):
+    serializable = {
+        h: {
+            "handle": p.handle,
+            "title": p.title,
+            "vendor": p.vendor,
+            "url": p.url,
+            "image": p.image,
+            "variants": {vid: asdict(v) for vid, v in p.variants.items()},
+        }
+        for h, p in snap.items()
+    }
+    with open(SNAPSHOT_PATH, "w", encoding="utf-8") as f:
+        json.dump(serializable, f, ensure_ascii=False, indent=2)
+
+
+# ---------- Discord 发送（Embed，右侧缩略图） ----------
+def send_embed(description: str, thumb: Optional[str]):
+    """
+    标题固定：🔔 <类型> 🇨🇦 加拿大官网
+    description：按要求的多行文本
+    缩略图：右侧展示
+    """
+    if not DISCORD_WEBHOOK:
+        print("[TEST MODE] would send:\n", description)
+        return
+    embed = {
+        "title": "🔔 通知 🇨🇦 加拿大官网",  # 具体类型在 description 第一行携带
+        "color": 0x2B65EC,  # 蓝色竖线
+        "description": description.strip(),
+    }
+    if thumb:
+        embed["thumbnail"] = {"url": thumb}
+
+    payload = {"embeds": [embed]}
+    headers = {"Content-Type": "application/json", "User-Agent": USER_AGENT}
+    for i in range(3):
+        try:
+            r = SESSION.post(DISCORD_WEBHOOK, headers=headers, data=json.dumps(payload), timeout=20)
+            if 200 <= r.status_code < 300:
+                return
+            else:
+                print(f"[Discord] {r.status_code}: {r.text}")
+        except requests.RequestException as e:
+            print(f"[Discord error] {e}")
+        time.sleep(1.2 * (i + 1))
+
+
+# ---------- 消息格式化（严格按你给的样式） ----------
+def format_inventory_line_for_product(p: ProductState) -> str:
+    # 聚合各尺码：Size:qty（若无数量但在售，则记为1；缺货为0）
+    counts: Dict[str, int] = {}
+    for v in p.variants.values():
+        size = v.option2 or v.option1 or "N/A"
+        qty = v.inventory_quantity if isinstance(v.inventory_quantity, int) else (1 if v.available else 0)
+        counts[size] = counts.get(size, 0) + max(0, int(qty))
+    if not counts:
+        return "无"
+    # 保持稳定顺序：XXS, XS, S, M, L, XL, XXL, 其他
+    order = ["XXXS","XXS","XS","S","M","L","XL","XXL","XXXL"]
+    sorted_items = sorted(counts.items(), key=lambda kv: (order.index(kv[0]) if kv[0] in order else 999, kv[0]))
+    return " | ".join([f"{k}:{v}" for k, v in sorted_items])
+
+def description_new(p: ProductState) -> str:
+    # 取一个代表变体（用于货号/颜色/价格显示）
+    anyv = next(iter(p.variants.values()))
+    lines = [
+        "🔔 上新提醒 🇨🇦 加拿大官网",
+        f"• 名称：{p.title}",
+        f"• 货号：{anyv.sku or '未知'}",
+        f"• 颜色：{anyv.option1 or '未知'}",
+        f"• 价格：CA$ {anyv.price:.0f}" if anyv.price == int(anyv.price) else f"• 价格：CA$ {anyv.price:.2f}",
+        f"🧾 库存信息：{format_inventory_line_for_product(p)}",
+        "",
+        # 不加链接，严格按你给的格式
+        "（右侧商品缩略图）",
+    ]
+    return "\n".join(lines)
+
+def description_restock(p: ProductState, v: VariantState) -> str:
+    lines = [
+        "🔔 补货提醒 🇨🇦 加拿大官网",
+        f"• 名称：{p.title}",
+        f"• 货号：{v.sku or '未知'}",
+        f"• 颜色：{v.option1 or '未知'}",
+        f"• 价格：CA$ {v.price:.0f}" if v.price == int(v.price) else f"• 价格：CA$ {v.price:.2f}",
+        f"🧾 库存信息：{(v.option2 or 'N/A')}:{v.inventory_quantity if isinstance(v.inventory_quantity, int) else (1 if v.available else 0)}",
+        "",
+        "（右侧商品缩略图）",
+    ]
+    return "\n".join(lines)
+
+def description_price(p: ProductState, v_old: VariantState, v_new: VariantState) -> str:
+    lines = [
+        "🔔 价格变化 🇨🇦 加拿大官网",
+        f"• 名称：{p.title}",
+        f"• 货号：{v_new.sku or '未知'}",
+        f"• 颜色：{v_new.option1 or '未知'}",
+        f"• 价格：CA$ {v_old.price:.2f} → CA$ {v_new.price:.2f}",
+        f"🧾 库存信息：{(v_new.option2 or 'N/A')}:{v_new.inventory_quantity if isinstance(v_new.inventory_quantity, int) else (1 if v_new.available else 0)}",
+        "",
+        "（右侧商品缩略图）",
+    ]
+    return "\n".join(lines)
+
+
+# ---------- 构建最新快照 ----------
 def build_snapshot() -> Snapshot:
     snap: Snapshot = {}
-    # Strategy A: products.json
     products = fetch_products_via_products_json()
-    from_products_json = bool(products)
-    handles: List[str] = []
-
-    if from_products_json:
+    if products:
         for p in products:
-            if not is_arcteryx(p.get("title", ""), p.get("vendor"), p.get("tags", [])):
+            if not is_arcteryx(p.get("title",""), p.get("vendor"), p.get("tags", [])):
                 continue
-            ps = normalize_product(p, from_products_json=True)
-            if ps:
-                snap[ps.handle] = ps
-                handles.append(ps.handle)
-        # Fallback enrich via .js (to get inventory_quantity if missing)
-        for h in handles:
-            time.sleep(0.25)
-            jsobj = fetch_product_js_by_handle(h)
-            if not jsobj:
+            ps = normalize_product_from_products_json(p)
+            if not ps:
                 continue
-            # only enrich inventory_quantity & available if provided
-            jsnorm = normalize_product(jsobj, from_products_json=False)
-            if not jsnorm:
-                continue
-            base = snap[h]
-            for vid, v in base.variants.items():
-                if vid in jsnorm.variants:
-                    jsv = jsnorm.variants[vid]
-                    if jsv.inventory_quantity is not None:
-                        v.inventory_quantity = jsv.inventory_quantity
-                    # some themes expose better available flag here
-                    v.available = jsv.available
+            # 再用 .js 补齐 inventory_quantity/available 准确性
+            js = fetch_product_js_by_handle(ps.handle)
+            if js:
+                jsn = normalize_product_from_js(js)
+                if jsn:
+                    # 合并：以 js 为准
+                    ps.image = jsn.image or ps.image
+                    for vid, v in ps.variants.items():
+                        if vid in jsn.variants:
+                            jsv = jsn.variants[vid]
+                            v.available = jsv.available
+                            if isinstance(jsv.inventory_quantity, int):
+                                v.inventory_quantity = jsv.inventory_quantity
+            snap[ps.handle] = ps
         return snap
 
-    # Strategy B: sitemap + product.js
-    prod_urls = iter_sitemap_product_urls()
-    for url in prod_urls:
-        handle = handle_from_product_url(url)
-        if not handle:
+    # 回退：sitemap + product.js
+    urls = iter_sitemap_product_urls()
+    for u in urls:
+        h = handle_from_product_url(u)
+        if not h:
             continue
-        time.sleep(0.3)
-        jsobj = fetch_product_js_by_handle(handle)
-        if not jsobj:
+        time.sleep(0.25)
+        js = fetch_product_js_by_handle(h)
+        if not js:
             continue
-        if not is_arcteryx(jsobj.get("title", ""), jsobj.get("vendor"), jsobj.get("tags", [])):
+        if not is_arcteryx(js.get("title",""), js.get("vendor"), js.get("tags", [])):
             continue
-        ps = normalize_product(jsobj, from_products_json=False)
+        ps = normalize_product_from_js(js)
         if ps:
             snap[ps.handle] = ps
     return snap
 
+
+# ---------- Diff & 推送 ----------
 def diff_and_report(old: Snapshot, new: Snapshot):
-    # New product
+    # 新商品
     for handle, p in new.items():
         if handle not in old:
-            report_new_product(p)
+            send_embed(description_new(p), p.image)
 
-    # Existing products: check variants
+    # 变体新增 / 价格变化 / 库存状态变化 / 数量增加
     for handle, pnew in new.items():
         pold = old.get(handle)
         if not pold:
             continue
-        # new variants
+
+        # 新增变体 => 视为“上新提醒”
         for vid, vnew in pnew.variants.items():
             if vid not in pold.variants:
-                report_new_variant(pnew, vnew)
+                send_embed(description_new(pnew), pnew.image)
 
-        # changed variants
         for vid, vnew in pnew.variants.items():
             vold = pold.variants.get(vid)
             if not vold:
                 continue
-            # price change
-            if abs(vnew.price - vold.price) > 1e-6:
-                report_price_change(pnew, vold, vnew)
-            # availability change
+
+            # 价格变化
+            if abs((vnew.price or 0) - (vold.price or 0)) > 1e-6:
+                send_embed(description_price(pnew, vold, vnew), pnew.image)
+
+            # 库存状态变化（缺货→到货 or 反向）
             if bool(vnew.available) != bool(vold.available):
-                report_stock_status(pnew, vold, vnew)
-            # inventory increase (only if both sides know numbers)
+                # 只有到货才提醒（更贴近“补货提醒”语义）
+                if vnew.available:
+                    send_embed(description_restock(pnew, vnew), pnew.image)
+
+            # 库存数量增加（两边都有数量才比较）
             if isinstance(vnew.inventory_quantity, int) and isinstance(vold.inventory_quantity, int):
                 if vnew.inventory_quantity > vold.inventory_quantity:
-                    report_inventory_increase(pnew, vold, vnew, vnew.inventory_quantity - vold.inventory_quantity)
+                    send_embed(description_restock(pnew, vnew), pnew.image)
 
+
+# ---------- 主入口 ----------
 def main():
     old = load_snapshot()
     new = build_snapshot()
