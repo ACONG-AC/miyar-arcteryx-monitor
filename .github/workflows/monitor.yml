@@ -1,10 +1,9 @@
-# .github/workflows/monitor.yml
 name: Monitor Arc'teryx @ MIYAR
 
 on:
   schedule:
-    - cron: "*/21 * * * *"   # 每 21 分钟
-  workflow_dispatch: {}       # 可手动触发
+    - cron: "*/21 * * * *"  # 每 21 分钟
+  workflow_dispatch: {}
 
 concurrency:
   group: monitor-miyar
@@ -14,7 +13,7 @@ jobs:
   run:
     runs-on: ubuntu-latest
     permissions:
-      contents: write    # 允许提交 snapshot.json
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
