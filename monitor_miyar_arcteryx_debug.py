@@ -1,35 +1,31 @@
 # -*- coding: utf-8 -*-
 """
-调试版：强制 sitemap 模式 + 详细日志 + 确保 snapshot.json 写出
-监控 https://store.miyaradventures.com/ 上所有 Arc'teryx 商品：
-- 上新（新商品/新变体）
-- 价格变化
-- 仅提醒“缺货→到货”
-- 库存数量增加
-推送格式（示例）：
-🔔 上新提醒 miyar
-• 名称：Atom Hoody Men's
-• 货号：X000009556
-• 颜色：Trail Magic
-• 价格：CA$ 360
-🧾 库存信息：XL:1
+混合抓取（更稳）：
+1) 尝试 /products.json 分页；
+2) 若不可用，回退抓取 /collections/all?page=N 的 HTML，解析其中的 /products/<handle>；
+3) 对每个 handle 拉 /products/<handle>.js，做 Arc'teryx 过滤与变体级监控。
 
-🔗 [直达链接](https://store.miyaradventures.com/products/atom-hoody-mens)
+通知：
+- 🔔 上新提醒 miyar
+- 🔔 补货提醒 miyar（仅“缺货→到货”）
+- 🔔 价格变化 miyar
+- 文末带 🔗 直达链接，右侧缩略图（embed thumbnail）
 
-（右侧商品缩略图）
+日志：
+- 抓取来源、数量、每步统计、snapshot 读写绝对路径
+
+适配你当前的 workflow（每 21 分钟）
 """
-import json, os, time, traceback, xml.etree.ElementTree as ET
+import json, os, re, time, traceback, xml.etree.ElementTree as ET
 from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 from urllib.parse import urljoin, urlparse
 import requests
 
-# ---------------- 基础配置 ----------------
 BASE = "https://store.miyaradventures.com/"
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
 SNAPSHOT_PATH = os.environ.get("SNAPSHOT_PATH", "snapshot.json")
-USER_AGENT = "Mozilla/5.0 (compatible; MiyarArcMonitor/1.0; +https://github.com)"
-FORCE_SITEMAP_ONLY = True  # 调试版：强制只走 sitemap
+USER_AGENT = "Mozilla/5.0 (compatible; MiyarArcMonitor/1.1; +https://github.com)"
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": USER_AGENT, "Accept": "*/*"})
@@ -67,7 +63,6 @@ def money_to_float(x) -> float:
         if x is None:
             return 0.0
         if isinstance(x, (int, float)):
-            # 有些端点价格是分
             if isinstance(x, int) and x > 1000:
                 return round(x / 100.0, 2)
             return float(x)
@@ -94,15 +89,12 @@ def get_json(url: str, retries: int = 3, timeout: int = 20):
         try:
             r = SESSION.get(url, timeout=timeout)
             if r.status_code == 200:
-                ct = r.headers.get("Content-Type", "")
+                ct = (r.headers.get("Content-Type") or "")
                 if "json" in ct or url.endswith(".js") or url.endswith(".json"):
                     return r.json()
-                else:
-                    log(f"WARNING: Content-Type not json for {url}: {ct}")
-                    try:
-                        return r.json()
-                    except Exception:
-                        return None
+                # 某些主题返回 js 文本也能被 .json() 解析失败；直接忽略
+                log(f"get_json warn content-type for {url}: {ct}")
+                return None
             else:
                 log(f"get_json {url} -> HTTP {r.status_code}")
                 if r.status_code in (403, 404):
@@ -127,62 +119,65 @@ def get_text(url: str, retries: int = 3, timeout: int = 20) -> Optional[str]:
         time.sleep(1.0 * (i + 1))
     return None
 
-# ---------------- 抓取（强制 sitemap） ----------------
-def iter_sitemap_product_urls() -> List[str]:
-    urls = []
-    idx = 1
+# ---------------- 抓取来源 A：products.json ----------------
+def fetch_products_via_products_json(limit: int = 250) -> List[dict]:
+    out = []
+    page = 1
     while True:
-        url = urljoin(BASE, f"/sitemap_products_{idx}.xml")
-        xml = get_text(url)
-        if not xml:
-            log(f"sitemap_products_{idx}.xml not found, stop.")
+        url = urljoin(BASE, f"/products.json?limit={limit}&page={page}")
+        data = get_json(url)
+        if not data or not data.get("products"):
             break
-        try:
-            root = ET.fromstring(xml)
-            # 直接用命名空间 URI，兼容性更好
-            nodes = root.findall(".//{http://www.sitemaps.org/schemas/sitemap/0.9}url")
-            count = 0
-            for n in nodes:
-                loc = n.find("{http://www.sitemaps.org/schemas/sitemap/0.9}loc")
-                if loc is not None and loc.text:
-                    urls.append(loc.text.strip())
-                    count += 1
-            log(f"Parsed sitemap_products_{idx}.xml: {count} product URLs")
-        except ET.ParseError as e:
-            log(f"ParseError on sitemap_products_{idx}.xml: {e}")
+        out.extend(data["products"])
+        log(f"/products.json page={page} -> {len(data['products'])} items")
+        page += 1
+        if page > 40:
+            log("Stop at page>40 safety guard")
             break
-        idx += 1
-        if idx > 50:
-            log("Safety stop at 50 sitemaps.")
-            break
-        time.sleep(0.2)
-    log(f"Total product URLs from sitemap: {len(urls)}")
-    return urls
+        time.sleep(0.4)
+    log(f"/products.json total: {len(out)}")
+    return out
 
-def handle_from_url(url: str) -> Optional[str]:
-    try:
-        path = urlparse(url).path
+# ---------------- 抓取来源 B：collections/all HTML 爬取 ----------------
+PRODUCT_LINK_RE = re.compile(r'href=["\'](/products/[^"\']+)["\']', re.IGNORECASE)
+
+def find_product_handles_from_html(html: str) -> Set[str]:
+    handles: Set[str] = set()
+    for m in PRODUCT_LINK_RE.finditer(html or ""):
+        path = urlparse(m.group(1)).path
         parts = [p for p in path.split("/") if p]
-        if len(parts) >= 2 and parts[0] == "products":
-            return parts[1]
-    except Exception:
-        pass
-    return None
+        if len(parts) >= 2 and parts[0].lower() == "products":
+            handles.add(parts[1])
+    return handles
 
-def fetch_product_js(handle: str) -> Optional[dict]:
-    u = urljoin(BASE, f"/products/{handle}.js")
-    js = get_json(u)
-    if js is None:
-        log(f"product.js fetch failed for handle={handle}")
-    return js
+def crawl_collections_all(max_pages: int = 40) -> List[str]:
+    """遍历 /collections/all?page=N，直到无新链接或到达上限"""
+    all_handles: Set[str] = set()
+    for page in range(1, max_pages + 1):
+        url = urljoin(BASE, f"/collections/all?page={page}")
+        html = get_text(url)
+        if not html:
+            log(f"/collections/all?page={page} no html, stop.")
+            break
+        found = find_product_handles_from_html(html)
+        log(f"/collections/all?page={page} found handles: {len(found)} (unique so far {len(all_handles|found)})")
+        prev_size = len(all_handles)
+        all_handles |= found
+        if len(all_handles) == prev_size:
+            # 本页没有带来新产品，可能到尾页
+            if page > 1:
+                log("no new handles on this page, stop.")
+                break
+        time.sleep(0.5)
+    return sorted(all_handles)
 
-# ---------------- 标准化 ----------------
-def normalize_product_from_js(p: dict) -> Optional[ProductState]:
+# ---------------- normalize ----------------
+def normalize_product_from_products_json(p: dict) -> Optional[ProductState]:
     handle = p.get("handle")
     if not handle:
         return None
-    url = p.get("url") or urljoin(BASE, f"/products/{handle}")
-    image = try_get(p, "images", 0)  # js 里 images 是 URL 数组
+    url = urljoin(BASE, f"/products/{handle}")
+    image = try_get(p, "images", 0, "src")
     variants: Dict[str, VariantState] = {}
     for v in p.get("variants", []):
         vid = str(v.get("id"))
@@ -198,20 +193,41 @@ def normalize_product_from_js(p: dict) -> Optional[ProductState]:
             inventory_quantity=v.get("inventory_quantity") if isinstance(v.get("inventory_quantity"), int) else None,
         )
     return ProductState(
-        handle=handle,
-        title=p.get("title") or "",
-        vendor=p.get("vendor"),
-        url=url,
-        image=image,
-        variants=variants,
+        handle=handle, title=p.get("title") or "", vendor=p.get("vendor"),
+        url=url, image=image, variants=variants
+    )
+
+def normalize_product_from_js(p: dict) -> Optional[ProductState]:
+    handle = p.get("handle")
+    if not handle:
+        return None
+    url = p.get("url") or urljoin(BASE, f"/products/{handle}")
+    image = try_get(p, "images", 0)
+    variants: Dict[str, VariantState] = {}
+    for v in p.get("variants", []):
+        vid = str(v.get("id"))
+        variants[vid] = VariantState(
+            id=int(v.get("id")),
+            title=v.get("title") or "",
+            option1=v.get("option1"),
+            option2=v.get("option2"),
+            option3=v.get("option3"),
+            sku=v.get("sku"),
+            price=money_to_float(v.get("price")),
+            available=bool(v.get("available", False)),
+            inventory_quantity=v.get("inventory_quantity") if isinstance(v.get("inventory_quantity"), int) else None,
+        )
+    return ProductState(
+        handle=handle, title=p.get("title") or "", vendor=p.get("vendor"),
+        url=url, image=image, variants=variants
     )
 
 # ---------------- 识别品牌 ----------------
 def is_arcteryx(title: str, vendor: Optional[str], tags=None) -> bool:
     t, v = (title or "").lower(), (vendor or "").lower()
-    if "arcteryx" in t or "arc'teryx" in t:
+    if "arc'teryx" in v or "arcteryx" in v:
         return True
-    if "arcteryx" in v:
+    if "arc'teryx" in t or "arcteryx" in t:
         return True
     if tags and any("arcteryx" in str(tag).lower() for tag in tags):
         return True
@@ -219,8 +235,9 @@ def is_arcteryx(title: str, vendor: Optional[str], tags=None) -> bool:
 
 # ---------------- 快照 IO ----------------
 def load_snapshot() -> Snapshot:
+    abspath = os.path.abspath(SNAPSHOT_PATH)
     if not os.path.exists(SNAPSHOT_PATH):
-        log(f"snapshot not found at {os.path.abspath(SNAPSHOT_PATH)} (first run expected)")
+        log(f"snapshot not found at {abspath} (first run expected)")
         return {}
     try:
         with open(SNAPSHOT_PATH, "r", encoding="utf-8") as f:
@@ -232,7 +249,7 @@ def load_snapshot() -> Snapshot:
                 handle=pdata["handle"], title=pdata["title"], vendor=pdata.get("vendor"),
                 url=pdata["url"], image=pdata.get("image"), variants=variants
             )
-        log(f"snapshot loaded from {os.path.abspath(SNAPSHOT_PATH)} with {len(snap)} products")
+        log(f"snapshot loaded from {abspath} with {len(snap)} products")
         return snap
     except Exception as e:
         log(f"load_snapshot error: {e}\n{traceback.format_exc()}")
@@ -260,10 +277,10 @@ def save_snapshot(snap: Snapshot):
     except Exception as e:
         log(f"save_snapshot error: {e}\n{traceback.format_exc()}")
 
-# ---------------- Discord（embed，miyar 文案 + 链接） ----------------
+# ---------------- Discord（embed，miyar 文案 + 直达链接） ----------------
 def send_embed(description: str, thumb: Optional[str]):
     if not DISCORD_WEBHOOK:
-        log("[NO WEBHOOK] printing message instead:\n" + description)
+        log("[NO WEBHOOK] printing instead:\n" + description)
         return
     embed = {
         "title": "🔔 通知 miyar",
@@ -329,31 +346,47 @@ def desc_price_change(p: ProductState, vold: VariantState, vnew: VariantState) -
         "（右侧商品缩略图）"
     )
 
-# ---------------- 构建最新快照（强制 sitemap） ----------------
+# ---------------- 构建最新快照（混合抓取） ----------------
 def build_snapshot() -> Snapshot:
     snap: Snapshot = {}
-    log(f"FORCE_SITEMAP_ONLY = {FORCE_SITEMAP_ONLY}")
-    urls = iter_sitemap_product_urls()
-    if not urls:
-        log("No product URLs from sitemap. Check robots/CF/CDN.")
-        return {}
 
-    handles = []
-    for u in urls:
-        h = handle_from_url(u)
-        if h:
-            handles.append(h)
-    log(f"Handles extracted: {len(handles)}")
+    # A. 先试 products.json
+    products = fetch_products_via_products_json()
+    if products:
+        log("Use /products.json path")
+        for p in products:
+            if not is_arcteryx(p.get("title",""), p.get("vendor"), p.get("tags", [])):
+                continue
+            ps = normalize_product_from_products_json(p)
+            if not ps:
+                continue
+            # 用 .js 精准补齐 available / inventory_quantity / image
+            js = get_json(urljoin(BASE, f"/products/{ps.handle}.js"))
+            if js:
+                jsn = normalize_product_from_js(js)
+                if jsn:
+                    ps.image = jsn.image or ps.image
+                    for vid, v in ps.variants.items():
+                        if vid in jsn.variants:
+                            jsv = jsn.variants[vid]
+                            v.available = jsv.available
+                            if isinstance(jsv.inventory_quantity, int):
+                                v.inventory_quantity = jsv.inventory_quantity
+            snap[ps.handle] = ps
+        log(f"Snapshot via products.json: {len(snap)}")
+        if snap:
+            return snap
 
+    # B. 回退：爬 collections/all
+    log("Fallback to /collections/all crawl")
+    handles = crawl_collections_all(max_pages=50)
+    log(f"handles from collections/all: {len(handles)}")
     ok, skipped = 0, 0
     for i, h in enumerate(handles, 1):
-        if i % 25 == 0:
-            log(f"Processing {i}/{len(handles)} ...")
-        js = fetch_product_js(h)
+        js = get_json(urljoin(BASE, f"/products/{h}.js"))
         if not js:
             skipped += 1
             continue
-        # 仅按 title/vendor 识别品牌
         if not is_arcteryx(js.get("title",""), js.get("vendor"), js.get("tags", [])):
             skipped += 1
             continue
@@ -363,8 +396,10 @@ def build_snapshot() -> Snapshot:
             continue
         snap[ps.handle] = ps
         ok += 1
-        time.sleep(0.2)  # 礼貌延迟
-    log(f"Normalized products: ok={ok}, skipped={skipped}, total={len(snap)}")
+        if i % 25 == 0:
+            log(f"handled {i}/{len(handles)} -> ok={ok}, skipped={skipped}")
+        time.sleep(0.25)
+    log(f"Snapshot via collections: ok={ok}, skipped={skipped}, total={len(snap)}")
     return snap
 
 # ---------------- Diff & 推送 ----------------
@@ -381,7 +416,7 @@ def diff_and_report(old: Snapshot, new: Snapshot):
         if not pold:
             continue
 
-        # 新增变体 -> 当做上新提醒
+        # 新增变体 -> 作为上新
         for vid, vnew in pnew.variants.items():
             if vid not in pold.variants:
                 log(f"[NEW VARIANT] {pnew.title} ({handle}) vid={vid}")
@@ -394,27 +429,26 @@ def diff_and_report(old: Snapshot, new: Snapshot):
 
             # 价格变化
             if abs((vnew.price or 0) - (vold.price or 0)) > 1e-6:
-                log(f"[PRICE] {pnew.title} ({handle}) {vold.price} -> {vnew.price} (vid={vid})")
+                log(f"[PRICE] {pnew.title} ({handle}) {vold.price}->{vnew.price} (vid={vid})")
                 send_embed(desc_price_change(pnew, vold, vnew), pnew.image)
 
-            # 仅提醒“缺货→到货”
+            # 仅“缺货→到货”
             if (not bool(vold.available)) and bool(vnew.available):
-                log(f"[RESTOCK] {pnew.title} ({handle}) variant {vid} now available")
+                log(f"[RESTOCK] {pnew.title} ({handle}) vid={vid} now available")
                 send_embed(desc_restock(pnew, vnew), pnew.image)
 
             # 库存数量增加
             if isinstance(vnew.inventory_quantity, int) and isinstance(vold.inventory_quantity, int):
                 if vnew.inventory_quantity > vold.inventory_quantity:
-                    log(f"[QTY UP] {pnew.title} ({handle}) variant {vid} {vold.inventory_quantity}->{vnew.inventory_quantity}")
+                    log(f"[QTY UP] {pnew.title} ({handle}) vid={vid} {vold.inventory_quantity}->{vnew.inventory_quantity}")
                     send_embed(desc_restock(pnew, vnew), pnew.image)
 
 # ---------------- 主入口 ----------------
 def list_dir(label: str):
     try:
-        files = os.listdir(".")
-        log(f"{label} | CWD={os.getcwd()} | files={files}")
+        print(f"[DEBUG] {label} | CWD={os.getcwd()} | files={os.listdir('.')}")
     except Exception as e:
-        log(f"list_dir error: {e}")
+        print(f"[DEBUG] list_dir error: {e}")
 
 def main():
     log(f"START cwd={os.getcwd()}")
@@ -426,7 +460,7 @@ def main():
     log(f"products found (new snapshot size) = {len(new)}")
     diff_and_report(old, new)
 
-    # 无论是否有变化，一定写快照（首次必须落盘）
+    # 一定写快照（首次必须落盘）
     save_snapshot(new)
     list_dir("AFTER SAVE")
 
