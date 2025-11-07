@@ -1,4 +1,4 @@
-name: Monitor Arc'teryx @ MIYAR
+name: Monitor Arc'teryx @ MIYAR (debug)
 
 on:
   schedule:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch: {}
 
 concurrency:
-  group: monitor-miyar
+  group: monitor-miyar-debug
   cancel-in-progress: false
 
 jobs:
@@ -28,12 +28,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run monitor
+      - name: Run monitor (debug)
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           SNAPSHOT_PATH: snapshot.json
         run: |
-          python monitor_miyar_arcteryx.py
+          python monitor_miyar_arcteryx_debug.py
 
       - name: Commit snapshot if changed
         run: |
