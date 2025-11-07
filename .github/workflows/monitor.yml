@@ -1,4 +1,4 @@
-name: Monitor Arc'teryx @ MIYAR (robust commit)
+name: Monitor Arc'teryx @ MIYAR (robust sync)
 
 on:
   schedule:
@@ -13,9 +13,9 @@ jobs:
   run:
     runs-on: ubuntu-latest
     permissions:
-      contents: write    # 关键：允许写代码库内容
+      contents: write    # 关键：允许写入仓库内容
     steps:
-      # 1) Checkout 必须完整历史，避免 push 非快进问题
+      # 1) 完整历史，避免非快进问题
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -31,6 +31,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # 2) 运行监控脚本（会生成/更新 snapshot.json）
       - name: Run monitor
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
@@ -38,54 +39,51 @@ jobs:
         run: |
           python monitor_miyar_arcteryx_debug.py
 
-      # 调试信息（可保留，方便排查）
-      - name: Git debug info
-        run: |
-          echo "Actor: $GITHUB_ACTOR"
-          echo "Ref: $GITHUB_REF"
-          echo "Ref Name: ${GITHUB_REF_NAME}"
-          git --version
-          git remote -v
-          git status
-          ls -la
-
-      # 2) 稳健地提交 snapshot.json（含首次生成）
-      - name: Commit snapshot if changed (robust)
+      # 3) 稳健提交：先备份，再硬重置到远端最新，最后还原快照并提交推送
+      - name: Commit snapshot (force-sync with remote)
         env:
           BRANCH_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
 
-          # 解除可能的忽略规则
+          # 备份本次生成的快照
+          if [ -f snapshot.json ]; then
+            cp -f snapshot.json /tmp/snapshot.json
+            echo "Backed up snapshot.json to /tmp/snapshot.json"
+          else
+            echo "snapshot.json not found; nothing to commit."
+            exit 0
+          fi
+
+          # Git 基本配置
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+          # 同步到远端最新（避免非快进 & 索引脏）
+          git fetch origin "${BRANCH_NAME}"
+          git checkout "${BRANCH_NAME}"
+          git reset --hard "origin/${BRANCH_NAME}"
+
+          # 还原快照；避免 .gitignore 屏蔽
+          mv -f /tmp/snapshot.json snapshot.json
           if [ -f .gitignore ]; then
             if grep -q '^snapshot\.json$' .gitignore; then
-              echo "Removing snapshot.json from .gitignore"
               sed -i '/^snapshot\.json$/d' .gitignore
               git add .gitignore
             fi
           fi
 
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          # 添加所有改动（包含新文件）
-          git add -A
-
-          # 如果没有 staged 改动则退出
+          git add snapshot.json
           if git diff --cached --quiet; then
-            echo "No changes to commit."
+            echo "No changes to commit (snapshot identical to remote)."
             exit 0
           fi
 
-          # 避免非快进：先拉取并 rebase（分支可能是 main）
-          git pull --rebase origin "${BRANCH_NAME}" || true
-
           git commit -m "chore: update snapshot.json [skip ci]"
-
-          # 推送（失败重试一次）
           git push origin "${BRANCH_NAME}" || (sleep 2 && git push origin "${BRANCH_NAME}")
 
-      # 3) 兜底：即使 push 失败，也把文件上传为 artifact，方便下载
+      # 4) 兜底：即使 push 失败，也上传本次快照为工件，便于下载核查
       - name: Upload snapshot artifact
         if: always()
         uses: actions/upload-artifact@v4
