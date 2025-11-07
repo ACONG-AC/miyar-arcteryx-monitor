@@ -1,49 +1,95 @@
-name: Monitor Arc'teryx @ MIYAR (debug)
+name: Monitor Arc'teryx @ MIYAR (robust commit)
 
 on:
   schedule:
-    - cron: "*/21 * * * *"  # 每 21 分钟
+    - cron: "*/21 * * * *"   # 每 21 分钟
   workflow_dispatch: {}
 
 concurrency:
-  group: monitor-miyar-debug
+  group: monitor-miyar
   cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write    # 关键：允许写代码库内容
     steps:
+      # 1) Checkout 必须完整历史，避免 push 非快进问题
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run monitor (debug)
+      - name: Run monitor
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           SNAPSHOT_PATH: snapshot.json
         run: |
           python monitor_miyar_arcteryx_debug.py
 
-      - name: Commit snapshot if changed
+      # 调试信息（可保留，方便排查）
+      - name: Git debug info
         run: |
-          set -e
-          if ! git diff --quiet -- snapshot.json; then
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add snapshot.json
-            git commit -m "chore: update snapshot.json [skip ci]"
-            git push
-          else
-            echo "No snapshot changes."
+          echo "Actor: $GITHUB_ACTOR"
+          echo "Ref: $GITHUB_REF"
+          echo "Ref Name: ${GITHUB_REF_NAME}"
+          git --version
+          git remote -v
+          git status
+          ls -la
+
+      # 2) 稳健地提交 snapshot.json（含首次生成）
+      - name: Commit snapshot if changed (robust)
+        env:
+          BRANCH_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # 解除可能的忽略规则
+          if [ -f .gitignore ]; then
+            if grep -q '^snapshot\.json$' .gitignore; then
+              echo "Removing snapshot.json from .gitignore"
+              sed -i '/^snapshot\.json$/d' .gitignore
+              git add .gitignore
+            fi
           fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 添加所有改动（包含新文件）
+          git add -A
+
+          # 如果没有 staged 改动则退出
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          # 避免非快进：先拉取并 rebase（分支可能是 main）
+          git pull --rebase origin "${BRANCH_NAME}" || true
+
+          git commit -m "chore: update snapshot.json [skip ci]"
+
+          # 推送（失败重试一次）
+          git push origin "${BRANCH_NAME}" || (sleep 2 && git push origin "${BRANCH_NAME}")
+
+      # 3) 兜底：即使 push 失败，也把文件上传为 artifact，方便下载
+      - name: Upload snapshot artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snapshot-json
+          path: snapshot.json
+          if-no-files-found: warn
